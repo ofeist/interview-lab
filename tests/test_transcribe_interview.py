@@ -133,6 +133,7 @@ class OutputTests(unittest.TestCase):
 
         self.assertEqual(result["segments"][0]["speaker"], "A")
         self.assertIn("total  33.3%", stdout.getvalue())
+        self.assertIn("00:03:20.000 left", stdout.getvalue())
 
 
 if __name__ == "__main__":

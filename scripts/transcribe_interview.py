@@ -569,12 +569,12 @@ def collect_streamed_transcription(
             segments.append(event)
             try:
                 completed_seconds = float(event["end"])
-                progress = format_timestamp(completed_seconds)
                 chunk_percent = min(100.0, completed_seconds / total_duration * 100)
                 if original_duration is None:
                     remaining = format_timestamp(max(0.0, total_duration - completed_seconds))
-                    progress_details = (
-                        f"{chunk_percent:5.1f}% complete, {remaining} of audio remaining"
+                    progress_message = (
+                        f"{progress_label}{len(segments)} seg | {chunk_percent:5.1f}% | "
+                        f"{remaining} audio left"
                     )
                 else:
                     original_completed = original_offset + completed_seconds
@@ -586,16 +586,14 @@ def collect_streamed_transcription(
                     overall_remaining = format_timestamp(
                         max(0.0, original_duration - original_completed)
                     )
-                    progress_details = (
-                        f"chunk {chunk_percent:5.1f}%; total {overall_percent:5.1f}%; "
-                        f"{overall_remaining} of original audio remaining"
+                    progress_message = (
+                        f"{progress_label}{len(segments)} seg | chunk {chunk_percent:5.1f}% | "
+                        f"total {overall_percent:5.1f}% | {overall_remaining} left"
                     )
             except (KeyError, TypeError, ValueError):
-                progress = "unknown time"
-                progress_details = "progress unavailable"
+                progress_message = f"{progress_label}{len(segments)} seg | progress unavailable"
             print(
-                f"{progress_label}Received {len(segments)} segment(s), through {progress} "
-                f"({progress_details})",
+                progress_message,
                 end="\r",
                 flush=True,
             )
@@ -1040,7 +1038,7 @@ def transcribe_chunked(source: Path, *, force: bool) -> None:
                 Path(chunk["path"]),
                 float(chunk["duration_seconds"]),
                 known_speakers=request_references,
-                progress_label=f"Chunk {index}/{len(chunks)} — ",
+                progress_label=f"{index}/{len(chunks)} ",
                 original_offset=float(chunk["upload_start_seconds"]),
                 original_duration=original_duration,
                 core_start=float(chunk["core_start_seconds"]),
