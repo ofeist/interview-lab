@@ -315,7 +315,7 @@ def multipart_body(fields: dict[str, str], audio_path: Path) -> tuple[bytes, str
     return b"".join(chunks), boundary
 
 
-def collect_streamed_transcription(response: object) -> dict:
+def collect_streamed_transcription(response: object, total_duration: float) -> dict:
     """Collect a server-sent event stream into a diarized response object."""
     events: list[dict] = []
     segments: list[dict] = []
@@ -345,11 +345,17 @@ def collect_streamed_transcription(response: object) -> dict:
         if event_type == "transcript.text.segment":
             segments.append(event)
             try:
-                progress = format_timestamp(float(event["end"]))
+                completed_seconds = float(event["end"])
+                progress = format_timestamp(completed_seconds)
+                percent = min(100.0, completed_seconds / total_duration * 100)
+                remaining = format_timestamp(max(0.0, total_duration - completed_seconds))
+                progress_details = f"{percent:5.1f}% complete, {remaining} of audio remaining"
             except (KeyError, TypeError, ValueError):
                 progress = "unknown time"
+                progress_details = "progress unavailable"
             print(
-                f"Received {len(segments)} completed speaker segment(s), through {progress}",
+                f"Received {len(segments)} segment(s), through {progress} "
+                f"({progress_details})",
                 end="\r",
                 flush=True,
             )
@@ -384,7 +390,7 @@ def collect_streamed_transcription(response: object) -> dict:
     }
 
 
-def call_api(audio_path: Path) -> dict:
+def call_api(audio_path: Path, total_duration: float) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         fail(
@@ -412,7 +418,7 @@ def call_api(audio_path: Path) -> dict:
     )
     try:
         with urllib.request.urlopen(request, timeout=3600) as response:
-            return collect_streamed_transcription(response)
+            return collect_streamed_transcription(response, total_duration)
     except urllib.error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
         fail(f"OpenAI API returned HTTP {exc.code}: {details}")
@@ -625,7 +631,7 @@ def transcribe(source: Path, kind: str, start: float, sample_duration: float, fo
             "do not put it in chat or a project file."
         )
     print(f"Sending {audio_path.name} to {MODEL}...")
-    raw = call_api(audio_path)
+    raw = call_api(audio_path, float(manifest["prepared_audio"]["duration_seconds"]))
     outputs = render_results(raw, manifest)
     for label, path in outputs.items():
         print(f"{label}: {path}")
