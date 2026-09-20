@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import subprocess
 import unicodedata
 import urllib.error
@@ -278,6 +279,7 @@ def prepare_audio(
             "language": LANGUAGE,
             "response_format": RESPONSE_FORMAT,
             "chunking_strategy": CHUNKING_STRATEGY,
+            "stream": True,
         },
     }
     manifest_path = output.with_suffix(".manifest.json")
@@ -313,6 +315,75 @@ def multipart_body(fields: dict[str, str], audio_path: Path) -> tuple[bytes, str
     return b"".join(chunks), boundary
 
 
+def collect_streamed_transcription(response: object) -> dict:
+    """Collect a server-sent event stream into a diarized response object."""
+    events: list[dict] = []
+    segments: list[dict] = []
+    done_event: dict | None = None
+    event_name: str | None = None
+    data_lines: list[str] = []
+
+    def process_event() -> None:
+        nonlocal done_event, event_name, data_lines
+        if not data_lines:
+            event_name = None
+            return
+        payload = "\n".join(data_lines)
+        current_event_name = event_name
+        event_name = None
+        data_lines = []
+        if payload == "[DONE]":
+            return
+        try:
+            event = json.loads(payload)
+        except json.JSONDecodeError as exc:
+            fail(f"the API returned an invalid streaming event: {exc}")
+        if not isinstance(event, dict):
+            fail("the API returned a non-object streaming event")
+        event_type = str(event.get("type") or current_event_name or "")
+        events.append(event)
+        if event_type == "transcript.text.segment":
+            segments.append(event)
+            try:
+                progress = format_timestamp(float(event["end"]))
+            except (KeyError, TypeError, ValueError):
+                progress = "unknown time"
+            print(
+                f"Received {len(segments)} completed speaker segment(s), through {progress}",
+                end="\r",
+                flush=True,
+            )
+        elif event_type == "transcript.text.done":
+            done_event = event
+        elif event_type in {"error", "transcript.error"}:
+            fail(f"OpenAI API streaming error: {event}")
+
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            process_event()
+        elif line.startswith("event:"):
+            event_name = line[6:].strip()
+        elif line.startswith("data:"):
+            data_lines.append(line[5:].lstrip())
+    process_event()
+    if segments:
+        print()
+    if done_event is None:
+        fail("the API stream ended before transcript.text.done was received")
+    if not segments:
+        fail("the completed API stream contains no diarized speaker segments")
+    return {
+        "task": "transcribe",
+        "duration": max(float(item.get("end", 0)) for item in segments),
+        "text": str(done_event.get("text") or " ".join(item.get("text", "") for item in segments)),
+        "segments": segments,
+        "usage": done_event.get("usage"),
+        "streamed": True,
+        "stream_events": events,
+    }
+
+
 def call_api(audio_path: Path) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
@@ -325,6 +396,7 @@ def call_api(audio_path: Path) -> dict:
         "language": LANGUAGE,
         "response_format": RESPONSE_FORMAT,
         "chunking_strategy": CHUNKING_STRATEGY,
+        "stream": "true",
     }
     body, boundary = multipart_body(fields, audio_path)
     request = urllib.request.Request(
@@ -333,18 +405,24 @@ def call_api(audio_path: Path) -> dict:
         method="POST",
         headers={
             "Authorization": f"Bearer {api_key}",
+            "Accept": "text/event-stream",
             "Content-Type": f"multipart/form-data; boundary={boundary}",
             "User-Agent": "interview-transcription/1.0",
         },
     )
     try:
-        with urllib.request.urlopen(request, timeout=1800) as response:
-            return json.loads(response.read().decode("utf-8"))
+        with urllib.request.urlopen(request, timeout=3600) as response:
+            return collect_streamed_transcription(response)
     except urllib.error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
         fail(f"OpenAI API returned HTTP {exc.code}: {details}")
     except urllib.error.URLError as exc:
         fail(f"could not connect to the OpenAI API: {exc.reason}")
+    except (TimeoutError, socket.timeout):
+        fail(
+            "the OpenAI API stream timed out before completion. The request may still have "
+            "been billed; check the API usage dashboard before retrying."
+        )
 
 
 def normalized_segments(raw: dict, offset: float) -> tuple[list[dict], dict[str, str]]:

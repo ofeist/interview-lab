@@ -11,6 +11,8 @@ projekt, zapis postavki ni naredbeni redak.
 - jezik: `de`
 - format odgovora: `diarized_json`
 - podjela na strani API-ja: `chunking_strategy=auto` (VAD)
+- prijenos odgovora: `stream=true`; skripta prikazuje napredak po dovršenim
+  govornim segmentima i izbjegava dugo čekanje bez mrežnih podataka
 - govornici: neutralne oznake `S1`, `S2` itd.; uloge se dodjeljuju tek nakon
   ljudske provjere
 - cijeli intervju: jedna mono AAC/M4A izvedenica ispod 25 MB, radi globalnih
@@ -64,7 +66,8 @@ shell-povijest ili razgovor bez izričite zaštite tog spremišta.
 
 Za svaki način (`sample` ili `full`) nastaju:
 
-- `api_raw.json`: neizmijenjeni odgovor API-ja;
+- `api_raw.json`: objedinjeni streaming odgovor, uključujući izvorne API
+  događaje u `stream_events`;
 - `transcript.json`: normalizirani segmenti, vremena u odnosu na original i
   oznake `S1`, `S2`;
 - `transcript.txt`: čitljivi odlomci s govornicima i vremenskim oznakama;
@@ -84,9 +87,13 @@ Javni cjenik ne prikazuje zaseban minutni red za diarizirani model; zato se za
 planiranje koristi približna stopa `gpt-4o-transcribe` od 0,006 USD/min, a
 stvarni iznos može odstupati zbog tokenizacije.
 
-Za ovu snimku (50:24,5): približno 0,30 USD. Za 15 sati: približno 5,40 USD.
-Probnih osam minuta: približno 0,05 USD. Cijene treba ponovno provjeriti prije
-veće serije.
+Početna procjena prema javnoj zamjenskoj minutnoj stopi bila je približno 0,30
+USD za ovu snimku, 5,40 USD za 15 sati i 0,05 USD za probnih osam minuta.
+Stvarno zabilježeni trošak prvog 8-minutnog diarizacijskog zahtjeva bio je 0,10
+USD (zahtjev je završio klijentskim timeoutom). Ako se ta stopa pokaže
+reprezentativnom, praktična procjena iznosi približno 0,63 USD za ovu snimku i
+11,25 USD za 15 sati. Neuspjeli ili ponovljeni zahtjevi mogu se dodatno
+naplatiti. Cijene i stvarnu potrošnju treba provjeriti prije veće serije.
 
 ## Metodološka napomena
 
