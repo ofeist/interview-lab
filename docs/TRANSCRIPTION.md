@@ -18,9 +18,10 @@ projekt, zapis postavki ni naredbeni redak.
 - lokalni dijelovi: najviše približno 20 minuta, granice blizu tišine i 10
   sekundi preklapanja sa svake strane; ovo je potrebno jer je API za odabrani
   model vratio maksimalno trajanje od 1.400 sekundi po zahtjevu
-- dosljednost govornika: nakon prvog dijela skripta izrađuje kratke lokalne
-  glasovne reference (do četiri govornika) i šalje ih uz sljedeće dijelove;
-  dodatno uspoređuje govornike u preklapanju
+- dosljednost govornika: ako postoji probni transkript iste izvorne snimke,
+  skripta koristi njegove provjerene oznake za ispravljanje oznaka prvog dijela;
+  zatim izrađuje kratke lokalne glasovne reference (do četiri govornika) i
+  šalje ih uz sljedeće dijelove te dodatno uspoređuje govornike u preklapanju
 - spajanje: vremenske oznake vraćaju se na vrijeme originala, a segmenti se
   zadržavaju prema središtu nepreklapajućeg područja kako se preklapanje ne bi
   dupliciralo

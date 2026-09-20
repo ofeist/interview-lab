@@ -47,6 +47,34 @@ class ChunkingTests(unittest.TestCase):
 
         self.assertEqual(mapping, {"B": "S1", "A": "S2"})
 
+    def test_overlap_can_collapse_spurious_labels(self) -> None:
+        previous = [{"start": 90.0, "end": 100.0, "speaker": "S1"}]
+        current = [
+            {"start": 90.0, "end": 95.0, "speaker_raw": "A"},
+            {"start": 95.0, "end": 100.0, "speaker_raw": "B"},
+        ]
+
+        mapping, _ = transcription.reconcile_speaker_mapping(
+            current, previous, {"S1"}
+        )
+
+        self.assertEqual(mapping, {"A": "S1", "B": "S1"})
+
+    def test_validation_sample_collapses_spurious_labels(self) -> None:
+        sample = [
+            {"start": 0.0, "end": 5.0, "speaker": "S1"},
+            {"start": 5.0, "end": 10.0, "speaker": "S2"},
+        ]
+        current = [
+            {"start": 0.0, "end": 4.0, "speaker_raw": "A"},
+            {"start": 4.0, "end": 5.0, "speaker_raw": "C"},
+            {"start": 5.0, "end": 10.0, "speaker_raw": "B"},
+        ]
+
+        mapping, _ = transcription.map_speakers_from_sample(current, sample)
+
+        self.assertEqual(mapping, {"A": "S1", "C": "S1", "B": "S2"})
+
     def test_core_selection_removes_overlap_duplicates(self) -> None:
         segments = [
             {"start": 95.0, "end": 99.0},
@@ -61,6 +89,16 @@ class ChunkingTests(unittest.TestCase):
 
 
 class OutputTests(unittest.TestCase):
+    def test_short_backchannels_are_not_review_candidates(self) -> None:
+        segments = [
+            {"start": 0.0, "end": 0.2, "speaker": "S1", "text": "Ja."},
+            {"start": 1.0, "end": 1.2, "speaker": "S2", "text": "Mhm."},
+        ]
+
+        candidates = transcription.review_candidates(segments, 1.2)
+
+        self.assertEqual(candidates, [])
+
     def test_normalization_preserves_global_speaker_labels(self) -> None:
         raw = {
             "segments": [

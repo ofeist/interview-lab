@@ -752,13 +752,11 @@ def reconcile_speaker_mapping(
             mapping[local] = local
             evidence[local] = "known speaker reference returned by the API"
 
-    candidates: list[tuple[float, str, str]] = []
     for local in local_speakers:
         if local in mapping:
             continue
+        scores: list[tuple[float, str]] = []
         for global_speaker in sorted(existing_speakers, key=speaker_sort_key):
-            if global_speaker in mapping.values():
-                continue
             score = 0.0
             for current_segment in current:
                 if current_segment["speaker_raw"] != local:
@@ -771,13 +769,12 @@ def reconcile_speaker_mapping(
                         min(current_segment["end"], previous_segment["end"])
                         - max(current_segment["start"], previous_segment["start"]),
                     )
-            candidates.append((score, local, global_speaker))
-
-    for score, local, global_speaker in sorted(candidates, reverse=True):
-        if score <= 0.1 or local in mapping or global_speaker in mapping.values():
-            continue
-        mapping[local] = global_speaker
-        evidence[local] = f"{score:.3f}s matching speech in the local overlap"
+            scores.append((score, global_speaker))
+        if scores:
+            score, global_speaker = max(scores)
+            if score > 0.1:
+                mapping[local] = global_speaker
+                evidence[local] = f"{score:.3f}s matching speech in the local overlap"
 
     remaining_local = [speaker for speaker in local_speakers if speaker not in mapping]
     remaining_global = [
@@ -795,6 +792,53 @@ def reconcile_speaker_mapping(
         new_label = next_speaker_label(existing_speakers | set(mapping.values()))
         mapping[local] = new_label
         evidence[local] = "new or unresolved speaker; manual continuity review required"
+    return mapping, evidence
+
+
+def map_speakers_from_sample(
+    current: list[dict], sample_segments: list[dict]
+) -> tuple[dict[str, str], dict[str, str]]:
+    sample_speakers = sorted(
+        {str(segment["speaker"]) for segment in sample_segments}, key=speaker_sort_key
+    )
+    mapping: dict[str, str] = {}
+    evidence: dict[str, str] = {}
+    for local in dict.fromkeys(segment["speaker_raw"] for segment in current):
+        if local in sample_speakers:
+            mapping[local] = local
+            evidence[local] = "speaker label already matches the validation sample"
+            continue
+        scores: list[tuple[float, str]] = []
+        for sample_speaker in sample_speakers:
+            score = 0.0
+            for current_segment in current:
+                if current_segment["speaker_raw"] != local:
+                    continue
+                for sample_segment in sample_segments:
+                    if sample_segment["speaker"] != sample_speaker:
+                        continue
+                    score += max(
+                        0.0,
+                        min(current_segment["end"], sample_segment["end"])
+                        - max(current_segment["start"], sample_segment["start"]),
+                    )
+            scores.append((score, sample_speaker))
+        if scores:
+            score, sample_speaker = max(scores)
+            if score > 0.05:
+                mapping[local] = sample_speaker
+                evidence[local] = (
+                    f"{score:.3f}s matching speech in the validated sample transcript"
+                )
+
+    assigned = set(sample_speakers) | set(mapping.values())
+    for local in dict.fromkeys(segment["speaker_raw"] for segment in current):
+        if local in mapping:
+            continue
+        new_label = next_speaker_label(assigned)
+        mapping[local] = new_label
+        assigned.add(new_label)
+        evidence[local] = "not present in the validation sample; assigned as a new speaker"
     return mapping, evidence
 
 
@@ -909,18 +953,57 @@ def load_cached_chunk(path: Path, signature: dict) -> dict | None:
         raw = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return None
-    if raw.get("_local_request") != signature or not raw.get("segments"):
+    cached_signature = raw.get("_local_request")
+    if not isinstance(cached_signature, dict) or not raw.get("segments"):
+        return None
+    essential_keys = {
+        "audio_sha256",
+        "model",
+        "language",
+        "response_format",
+        "chunking_strategy",
+    }
+    if any(cached_signature.get(key) != signature.get(key) for key in essential_keys):
         return None
     return raw
 
 
+def load_sample_segments(manifest: dict) -> tuple[list[dict], Path | None]:
+    slug = slugify(Path(manifest["source"]["path"]))
+    sample_path = RESULTS_ROOT / slug / "sample" / "transcript.json"
+    if not sample_path.exists():
+        return [], None
+    try:
+        sample = json.loads(sample_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        print(f"Warning: could not read validation sample: {sample_path}")
+        return [], None
+    if sample.get("source", {}).get("sha256") != manifest["source"]["sha256"]:
+        print(f"Warning: validation sample does not match the current source: {sample_path}")
+        return [], None
+    segments = sample.get("segments")
+    if not isinstance(segments, list) or not segments:
+        print(f"Warning: validation sample contains no segments: {sample_path}")
+        return [], None
+    normalized: list[dict] = []
+    for segment in segments:
+        try:
+            normalized.append(
+                {
+                    "start": float(segment["start"]),
+                    "end": float(segment["end"]),
+                    "speaker": str(segment["speaker"]),
+                    "text": str(segment.get("text", "")),
+                }
+            )
+        except (KeyError, TypeError, ValueError):
+            print(f"Warning: validation sample has an invalid segment: {sample_path}")
+            return [], None
+    return normalized, sample_path
+
+
 def transcribe_chunked(source: Path, *, force: bool) -> None:
     chunks, manifest = prepare_chunked_audio(source, force=force)
-    if not os.environ.get("OPENAI_API_KEY"):
-        fail(
-            "OPENAI_API_KEY is not set. Configure it in the local environment; "
-            "do not put it in chat or a project file."
-        )
 
     slug = slugify(source)
     output_dir = RESULTS_ROOT / slug / "full"
@@ -928,9 +1011,14 @@ def transcribe_chunked(source: Path, *, force: bool) -> None:
     chunk_output_dir.mkdir(parents=True, exist_ok=True)
     reference_dir = WORK_ROOT / slug / "audio" / "speaker_references"
     original_duration = float(manifest["source"]["duration_seconds"])
+    sample_segments, sample_path = load_sample_segments(manifest)
+    if sample_segments:
+        print(f"Using validation sample for speaker continuity: {sample_path}")
     merged_segments: list[dict] = []
     previous_segments: list[dict] = []
-    existing_speakers: set[str] = set()
+    existing_speakers: set[str] = {
+        segment["speaker"] for segment in sample_segments
+    }
     references: list[tuple[str, Path]] = []
     chunk_records: list[dict] = []
     merged_events: list[dict] = []
@@ -965,7 +1053,11 @@ def transcribe_chunked(source: Path, *, force: bool) -> None:
             print(f"Reusing completed chunk {index}/{len(chunks)}: {raw_path}")
 
         absolute_segments = absolute_chunk_segments(raw, chunk)
-        if is_first:
+        if is_first and sample_segments:
+            speaker_mapping, mapping_evidence = map_speakers_from_sample(
+                absolute_segments, sample_segments
+            )
+        elif is_first:
             speaker_mapping = initial_speaker_mapping(absolute_segments)
             mapping_evidence = {
                 raw_speaker: "assigned by first appearance in the first chunk"
@@ -1092,10 +1184,8 @@ def review_candidates(
         reasons: list[str] = []
         if uncertain.search(segment["text"]):
             reasons.append("a marker or parenthetical may indicate uncertain transcription")
-        if len(words) >= 6 and len(words) / duration > 4.8:
-            reasons.append("unusually high estimated speech rate")
-        if duration < 0.35 and words:
-            reasons.append("very short speech segment")
+        if len(words) >= 8 and len(words) / duration > 5.5:
+            reasons.append("extremely high estimated speech rate")
         if previous and segment["start"] < previous["end"] - 0.2:
             reasons.append("overlapping speaker segments")
         if reasons:
