@@ -8,9 +8,11 @@ reads the API key only from OPENAI_API_KEY.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -30,6 +32,14 @@ API_URL = "https://api.openai.com/v1/audio/transcriptions"
 API_UPLOAD_LIMIT_BYTES = 25_000_000
 TARGET_UPLOAD_BYTES = 23_500_000
 BITRATE_CHOICES_KBPS = (96, 80, 72, 64, 56, 48, 40)
+MODEL_MAX_AUDIO_SECONDS = 1400.0
+LOCAL_CHUNK_TARGET_SECONDS = 1200.0
+LOCAL_CHUNK_OVERLAP_SECONDS = 10.0
+LOCAL_CHUNK_SAFETY_SECONDS = 20.0
+SILENCE_SEARCH_WINDOW_SECONDS = 45.0
+SILENCE_THRESHOLD_DB = -35
+SILENCE_MIN_SECONDS = 0.45
+SPEAKER_REFERENCE_SECONDS = 5.0
 ROOT = Path(__file__).resolve().parents[1]
 WORK_ROOT = ROOT / "data" / "work"
 RESULTS_ROOT = ROOT / "data" / "results"
@@ -289,10 +299,214 @@ def prepare_audio(
     return output, manifest
 
 
-def multipart_body(fields: dict[str, str], audio_path: Path) -> tuple[bytes, str]:
+def compact_timestamp(seconds: float) -> str:
+    return format_timestamp(seconds).replace(":", "").replace(".", "-")
+
+
+def silence_midpoints(source: Path) -> list[float]:
+    result = run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-nostats",
+            "-i",
+            str(source),
+            "-map",
+            "0:a:0",
+            "-af",
+            f"silencedetect=noise={SILENCE_THRESHOLD_DB}dB:d={SILENCE_MIN_SECONDS}",
+            "-f",
+            "null",
+            "-",
+        ],
+        capture=True,
+    )
+    pattern = re.compile(
+        r"silence_end:\s*([0-9.]+)\s*\|\s*silence_duration:\s*([0-9.]+)"
+    )
+    midpoints: list[float] = []
+    for end_text, duration_text in pattern.findall(result.stderr or ""):
+        end = float(end_text)
+        silence_duration = float(duration_text)
+        midpoints.append(end - silence_duration / 2.0)
+    return midpoints
+
+
+def choose_chunk_boundaries(duration: float, silence_points: list[float]) -> list[float]:
+    chunk_count = max(1, math.ceil(duration / LOCAL_CHUNK_TARGET_SECONDS))
+    if chunk_count == 1:
+        return [0.0, duration]
+
+    maximum_core_duration = (
+        MODEL_MAX_AUDIO_SECONDS
+        - 2 * LOCAL_CHUNK_OVERLAP_SECONDS
+        - LOCAL_CHUNK_SAFETY_SECONDS
+    )
+    boundaries = [0.0]
+    for index in range(1, chunk_count):
+        ideal = duration * index / chunk_count
+        candidates = [
+            point
+            for point in silence_points
+            if abs(point - ideal) <= SILENCE_SEARCH_WINDOW_SECONDS
+            and point - boundaries[-1] <= maximum_core_duration
+        ]
+        boundaries.append(
+            min(candidates, key=lambda point: abs(point - ideal)) if candidates else ideal
+        )
+    boundaries.append(duration)
+
+    if any(
+        end - start > maximum_core_duration
+        for start, end in zip(boundaries, boundaries[1:])
+    ):
+        boundaries = [duration * index / chunk_count for index in range(chunk_count + 1)]
+    return boundaries
+
+
+def prepare_chunked_audio(source: Path, *, force: bool) -> tuple[list[dict], dict]:
+    info = probe(source)
+    if not audio_streams(info):
+        fail("the source has no audio stream")
+    source_duration = duration_seconds(info)
+    slug = slugify(source)
+    audio_dir = WORK_ROOT / slug / "audio" / "full_chunks"
+    audio_dir.mkdir(parents=True, exist_ok=True)
+
+    print("Finding quiet locations for local chunk boundaries...")
+    boundaries = choose_chunk_boundaries(source_duration, silence_midpoints(source))
+    chunks: list[dict] = []
+    for index, (core_start, core_end) in enumerate(zip(boundaries, boundaries[1:]), start=1):
+        upload_start = max(
+            0.0,
+            core_start - (LOCAL_CHUNK_OVERLAP_SECONDS if index > 1 else 0.0),
+        )
+        upload_end = min(
+            source_duration,
+            core_end
+            + (LOCAL_CHUNK_OVERLAP_SECONDS if index < len(boundaries) - 1 else 0.0),
+        )
+        requested_duration = upload_end - upload_start
+        output = audio_dir / (
+            f"chunk_{index:03d}_{compact_timestamp(upload_start)}_"
+            f"{compact_timestamp(upload_end)}.m4a"
+        )
+        if requested_duration >= MODEL_MAX_AUDIO_SECONDS - LOCAL_CHUNK_SAFETY_SECONDS:
+            fail(
+                f"planned chunk {index} is {requested_duration:.3f} seconds, too close to "
+                f"the model maximum of {MODEL_MAX_AUDIO_SECONDS:.0f} seconds"
+            )
+        if output.exists() and not force:
+            print(f"Prepared chunk already exists: {output}")
+        else:
+            run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "warning",
+                    "-y" if force else "-n",
+                    "-ss",
+                    str(upload_start),
+                    "-i",
+                    str(source),
+                    "-t",
+                    str(requested_duration),
+                    "-map",
+                    "0:a:0",
+                    "-vn",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "96k",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "48000",
+                    "-map_metadata",
+                    "-1",
+                    "-movflags",
+                    "+faststart",
+                    str(output),
+                ]
+            )
+        prepared_info = probe(output)
+        prepared_duration = duration_seconds(prepared_info)
+        if output.stat().st_size >= API_UPLOAD_LIMIT_BYTES:
+            fail(f"prepared chunk {index} exceeds the API upload limit")
+        if prepared_duration >= MODEL_MAX_AUDIO_SECONDS:
+            fail(
+                f"prepared chunk {index} is {prepared_duration:.3f} seconds and exceeds "
+                f"the model maximum of {MODEL_MAX_AUDIO_SECONDS:.0f} seconds"
+            )
+        chunks.append(
+            {
+                "index": index,
+                "path": str(output.resolve()),
+                "sha256": sha256(output),
+                "size_bytes": output.stat().st_size,
+                "duration_seconds": prepared_duration,
+                "core_start_seconds": core_start,
+                "core_end_seconds": core_end,
+                "upload_start_seconds": upload_start,
+                "upload_end_seconds": upload_end,
+            }
+        )
+
+    manifest = {
+        "schema_version": 1,
+        "created_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "source": {
+            "path": str(source.resolve()),
+            "sha256": sha256(source),
+            "size_bytes": source.stat().st_size,
+            "duration_seconds": source_duration,
+            "ffprobe": info,
+        },
+        "prepared_audio": {
+            "kind": "full",
+            "path": str(audio_dir.resolve()),
+            "offset_seconds": 0.0,
+            "duration_seconds": source_duration,
+            "chunked": True,
+            "chunk_target_seconds": LOCAL_CHUNK_TARGET_SECONDS,
+            "overlap_seconds": LOCAL_CHUNK_OVERLAP_SECONDS,
+            "boundary_method": "silence detection near evenly spaced targets",
+            "codec": "aac",
+            "bitrate_kbps_requested": 96,
+            "channels": 1,
+            "sample_rate_hz": 48000,
+            "metadata_removed": True,
+            "chunks": chunks,
+        },
+        "transcription_settings": {
+            "endpoint": API_URL,
+            "model": MODEL,
+            "language": LANGUAGE,
+            "response_format": RESPONSE_FORMAT,
+            "chunking_strategy": CHUNKING_STRATEGY,
+            "stream": True,
+            "model_max_audio_seconds_observed": MODEL_MAX_AUDIO_SECONDS,
+        },
+    }
+    manifest_path = audio_dir / "manifest.json"
+    write_json(manifest_path, manifest)
+    print(f"Prepared {len(chunks)} local chunks:")
+    for chunk in chunks:
+        print(
+            f"  {chunk['index']}/{len(chunks)}: "
+            f"{format_timestamp(chunk['upload_start_seconds'])}–"
+            f"{format_timestamp(chunk['upload_end_seconds'])} "
+            f"({chunk['size_bytes'] / 1_000_000:.2f} MB)"
+        )
+    print(f"Preparation manifest: {manifest_path}")
+    return chunks, manifest
+
+
+def multipart_body(fields: list[tuple[str, str]], audio_path: Path) -> tuple[bytes, str]:
     boundary = f"codex-{uuid.uuid4().hex}"
     chunks: list[bytes] = []
-    for name, value in fields.items():
+    for name, value in fields:
         chunks.extend(
             [
                 f"--{boundary}\r\n".encode(),
@@ -315,7 +529,16 @@ def multipart_body(fields: dict[str, str], audio_path: Path) -> tuple[bytes, str
     return b"".join(chunks), boundary
 
 
-def collect_streamed_transcription(response: object, total_duration: float) -> dict:
+def collect_streamed_transcription(
+    response: object,
+    total_duration: float,
+    *,
+    progress_label: str = "",
+    original_offset: float = 0.0,
+    original_duration: float | None = None,
+    core_start: float | None = None,
+    core_end: float | None = None,
+) -> dict:
     """Collect a server-sent event stream into a diarized response object."""
     events: list[dict] = []
     segments: list[dict] = []
@@ -347,14 +570,31 @@ def collect_streamed_transcription(response: object, total_duration: float) -> d
             try:
                 completed_seconds = float(event["end"])
                 progress = format_timestamp(completed_seconds)
-                percent = min(100.0, completed_seconds / total_duration * 100)
-                remaining = format_timestamp(max(0.0, total_duration - completed_seconds))
-                progress_details = f"{percent:5.1f}% complete, {remaining} of audio remaining"
+                chunk_percent = min(100.0, completed_seconds / total_duration * 100)
+                if original_duration is None:
+                    remaining = format_timestamp(max(0.0, total_duration - completed_seconds))
+                    progress_details = (
+                        f"{chunk_percent:5.1f}% complete, {remaining} of audio remaining"
+                    )
+                else:
+                    original_completed = original_offset + completed_seconds
+                    if core_start is not None:
+                        original_completed = max(core_start, original_completed)
+                    if core_end is not None:
+                        original_completed = min(core_end, original_completed)
+                    overall_percent = min(100.0, original_completed / original_duration * 100)
+                    overall_remaining = format_timestamp(
+                        max(0.0, original_duration - original_completed)
+                    )
+                    progress_details = (
+                        f"chunk {chunk_percent:5.1f}%; total {overall_percent:5.1f}%; "
+                        f"{overall_remaining} of original audio remaining"
+                    )
             except (KeyError, TypeError, ValueError):
                 progress = "unknown time"
                 progress_details = "progress unavailable"
             print(
-                f"Received {len(segments)} segment(s), through {progress} "
+                f"{progress_label}Received {len(segments)} segment(s), through {progress} "
                 f"({progress_details})",
                 end="\r",
                 flush=True,
@@ -390,20 +630,36 @@ def collect_streamed_transcription(response: object, total_duration: float) -> d
     }
 
 
-def call_api(audio_path: Path, total_duration: float) -> dict:
+def call_api(
+    audio_path: Path,
+    total_duration: float,
+    *,
+    known_speakers: list[tuple[str, Path]] | None = None,
+    progress_label: str = "",
+    original_offset: float = 0.0,
+    original_duration: float | None = None,
+    core_start: float | None = None,
+    core_end: float | None = None,
+) -> dict:
     api_key = os.environ.get("OPENAI_API_KEY")
     if not api_key:
         fail(
             "OPENAI_API_KEY is not set. Configure it in the local environment; "
             "do not put it in chat or a project file."
         )
-    fields = {
-        "model": MODEL,
-        "language": LANGUAGE,
-        "response_format": RESPONSE_FORMAT,
-        "chunking_strategy": CHUNKING_STRATEGY,
-        "stream": "true",
-    }
+    fields = [
+        ("model", MODEL),
+        ("language", LANGUAGE),
+        ("response_format", RESPONSE_FORMAT),
+        ("chunking_strategy", CHUNKING_STRATEGY),
+        ("stream", "true"),
+    ]
+    for speaker_name, reference_path in known_speakers or []:
+        encoded_reference = base64.b64encode(reference_path.read_bytes()).decode("ascii")
+        fields.append(("known_speaker_names[]", speaker_name))
+        fields.append(
+            ("known_speaker_references[]", f"data:audio/wav;base64,{encoded_reference}")
+        )
     body, boundary = multipart_body(fields, audio_path)
     request = urllib.request.Request(
         API_URL,
@@ -418,7 +674,15 @@ def call_api(audio_path: Path, total_duration: float) -> dict:
     )
     try:
         with urllib.request.urlopen(request, timeout=3600) as response:
-            return collect_streamed_transcription(response, total_duration)
+            return collect_streamed_transcription(
+                response,
+                total_duration,
+                progress_label=progress_label,
+                original_offset=original_offset,
+                original_duration=original_duration,
+                core_start=core_start,
+                core_end=core_end,
+            )
     except urllib.error.HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
         fail(f"OpenAI API returned HTTP {exc.code}: {details}")
@@ -431,16 +695,346 @@ def call_api(audio_path: Path, total_duration: float) -> dict:
         )
 
 
+def speaker_sort_key(label: str) -> tuple[int, str]:
+    match = re.fullmatch(r"S(\d+)", label)
+    return (int(match.group(1)), label) if match else (10_000, label)
+
+
+def next_speaker_label(existing: set[str]) -> str:
+    number = 1
+    while f"S{number}" in existing:
+        number += 1
+    return f"S{number}"
+
+
+def absolute_chunk_segments(raw: dict, chunk: dict) -> list[dict]:
+    raw_segments = raw.get("segments")
+    if not isinstance(raw_segments, list) or not raw_segments:
+        fail(f"chunk {chunk['index']} contains no diarized segments")
+    offset = float(chunk["upload_start_seconds"])
+    output: list[dict] = []
+    for index, segment in enumerate(raw_segments):
+        try:
+            start = offset + float(segment["start"])
+            end = offset + float(segment["end"])
+        except (KeyError, TypeError, ValueError):
+            fail(f"chunk {chunk['index']} segment {index} has invalid timestamps")
+        output.append(
+            {
+                "id": segment.get("id", f"segment-{index + 1}"),
+                "start": start,
+                "end": end,
+                "speaker_raw": str(segment.get("speaker", "unknown")),
+                "text": str(segment.get("text", "")).strip(),
+            }
+        )
+    return output
+
+
+def initial_speaker_mapping(segments: list[dict]) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for segment in segments:
+        raw_speaker = segment["speaker_raw"]
+        if raw_speaker not in mapping:
+            mapping[raw_speaker] = f"S{len(mapping) + 1}"
+    return mapping
+
+
+def reconcile_speaker_mapping(
+    current: list[dict], previous: list[dict], existing_speakers: set[str]
+) -> tuple[dict[str, str], dict[str, str]]:
+    local_speakers = list(dict.fromkeys(segment["speaker_raw"] for segment in current))
+    mapping: dict[str, str] = {}
+    evidence: dict[str, str] = {}
+
+    for local in local_speakers:
+        if local in existing_speakers:
+            mapping[local] = local
+            evidence[local] = "known speaker reference returned by the API"
+
+    candidates: list[tuple[float, str, str]] = []
+    for local in local_speakers:
+        if local in mapping:
+            continue
+        for global_speaker in sorted(existing_speakers, key=speaker_sort_key):
+            if global_speaker in mapping.values():
+                continue
+            score = 0.0
+            for current_segment in current:
+                if current_segment["speaker_raw"] != local:
+                    continue
+                for previous_segment in previous:
+                    if previous_segment["speaker"] != global_speaker:
+                        continue
+                    score += max(
+                        0.0,
+                        min(current_segment["end"], previous_segment["end"])
+                        - max(current_segment["start"], previous_segment["start"]),
+                    )
+            candidates.append((score, local, global_speaker))
+
+    for score, local, global_speaker in sorted(candidates, reverse=True):
+        if score <= 0.1 or local in mapping or global_speaker in mapping.values():
+            continue
+        mapping[local] = global_speaker
+        evidence[local] = f"{score:.3f}s matching speech in the local overlap"
+
+    remaining_local = [speaker for speaker in local_speakers if speaker not in mapping]
+    remaining_global = [
+        speaker
+        for speaker in sorted(existing_speakers, key=speaker_sort_key)
+        if speaker not in mapping.values()
+    ]
+    if len(remaining_local) == len(remaining_global) == 1:
+        mapping[remaining_local[0]] = remaining_global[0]
+        evidence[remaining_local[0]] = "inferred from the only unmatched existing speaker"
+
+    for local in local_speakers:
+        if local in mapping:
+            continue
+        new_label = next_speaker_label(existing_speakers | set(mapping.values()))
+        mapping[local] = new_label
+        evidence[local] = "new or unresolved speaker; manual continuity review required"
+    return mapping, evidence
+
+
+def apply_speaker_mapping(
+    segments: list[dict], mapping: dict[str, str], chunk_index: int
+) -> list[dict]:
+    output: list[dict] = []
+    for index, segment in enumerate(segments, start=1):
+        output.append(
+            {
+                **segment,
+                "id": f"chunk-{chunk_index:03d}-{segment['id'] or index}",
+                "speaker": mapping[segment["speaker_raw"]],
+                "chunk_index": chunk_index,
+            }
+        )
+    return output
+
+
+def select_core_segments(segments: list[dict], chunk: dict, is_last: bool) -> list[dict]:
+    core_start = float(chunk["core_start_seconds"])
+    core_end = float(chunk["core_end_seconds"])
+    selected: list[dict] = []
+    for segment in segments:
+        midpoint = (segment["start"] + segment["end"]) / 2.0
+        if midpoint < core_start:
+            continue
+        if midpoint >= core_end and not is_last:
+            continue
+        selected.append(segment)
+    return selected
+
+
+def build_speaker_references(
+    source: Path, segments: list[dict], reference_dir: Path
+) -> list[tuple[str, Path]]:
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    references: list[tuple[str, Path]] = []
+    speakers = sorted({segment["speaker"] for segment in segments}, key=speaker_sort_key)[:4]
+    for speaker in speakers:
+        candidates: list[tuple[float, float, dict, float, float]] = []
+        for segment in segments:
+            if segment["speaker"] != speaker:
+                continue
+            segment_duration = segment["end"] - segment["start"]
+            clip_duration = min(SPEAKER_REFERENCE_SECONDS, segment_duration - 0.4)
+            if clip_duration < 2.0:
+                continue
+            clip_start = segment["start"] + (segment_duration - clip_duration) / 2.0
+            clip_end = clip_start + clip_duration
+            other_speaker_overlap = sum(
+                max(0.0, min(clip_end, other["end"]) - max(clip_start, other["start"]))
+                for other in segments
+                if other["speaker"] != speaker
+            )
+            candidates.append(
+                (other_speaker_overlap, -clip_duration, segment, clip_start, clip_duration)
+            )
+        if not candidates:
+            print(f"Warning: no clean 2–10 second reference found for {speaker}")
+            continue
+        _, _, _, clip_start, clip_duration = min(candidates, key=lambda item: item[:2])
+        output = reference_dir / f"{speaker}.wav"
+        run(
+            [
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-y",
+                "-ss",
+                str(clip_start),
+                "-i",
+                str(source),
+                "-t",
+                str(clip_duration),
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-c:a",
+                "pcm_s16le",
+                "-ac",
+                "1",
+                "-ar",
+                "16000",
+                "-map_metadata",
+                "-1",
+                str(output),
+            ]
+        )
+        references.append((speaker, output))
+    return references
+
+
+def chunk_request_signature(chunk: dict, references: list[tuple[str, Path]]) -> dict:
+    return {
+        "audio_sha256": chunk["sha256"],
+        "model": MODEL,
+        "language": LANGUAGE,
+        "response_format": RESPONSE_FORMAT,
+        "chunking_strategy": CHUNKING_STRATEGY,
+        "speaker_references": [
+            {"name": name, "sha256": sha256(path)} for name, path in references
+        ],
+    }
+
+
+def load_cached_chunk(path: Path, signature: dict) -> dict | None:
+    if not path.exists():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if raw.get("_local_request") != signature or not raw.get("segments"):
+        return None
+    return raw
+
+
+def transcribe_chunked(source: Path, *, force: bool) -> None:
+    chunks, manifest = prepare_chunked_audio(source, force=force)
+    if not os.environ.get("OPENAI_API_KEY"):
+        fail(
+            "OPENAI_API_KEY is not set. Configure it in the local environment; "
+            "do not put it in chat or a project file."
+        )
+
+    slug = slugify(source)
+    output_dir = RESULTS_ROOT / slug / "full"
+    chunk_output_dir = output_dir / "chunks"
+    chunk_output_dir.mkdir(parents=True, exist_ok=True)
+    reference_dir = WORK_ROOT / slug / "audio" / "speaker_references"
+    original_duration = float(manifest["source"]["duration_seconds"])
+    merged_segments: list[dict] = []
+    previous_segments: list[dict] = []
+    existing_speakers: set[str] = set()
+    references: list[tuple[str, Path]] = []
+    chunk_records: list[dict] = []
+    merged_events: list[dict] = []
+
+    for chunk in chunks:
+        index = int(chunk["index"])
+        is_first = index == 1
+        is_last = index == len(chunks)
+        request_references = [] if is_first else references
+        signature = chunk_request_signature(chunk, request_references)
+        raw_path = chunk_output_dir / f"chunk_{index:03d}_api_raw.json"
+        raw = None if force else load_cached_chunk(raw_path, signature)
+        if raw is None:
+            print(
+                f"Sending chunk {index}/{len(chunks)} "
+                f"({Path(chunk['path']).name}) to {MODEL}..."
+            )
+            raw = call_api(
+                Path(chunk["path"]),
+                float(chunk["duration_seconds"]),
+                known_speakers=request_references,
+                progress_label=f"Chunk {index}/{len(chunks)} — ",
+                original_offset=float(chunk["upload_start_seconds"]),
+                original_duration=original_duration,
+                core_start=float(chunk["core_start_seconds"]),
+                core_end=float(chunk["core_end_seconds"]),
+            )
+            raw["_local_request"] = signature
+            write_json(raw_path, raw)
+            print(f"Saved completed chunk immediately: {raw_path}")
+        else:
+            print(f"Reusing completed chunk {index}/{len(chunks)}: {raw_path}")
+
+        absolute_segments = absolute_chunk_segments(raw, chunk)
+        if is_first:
+            speaker_mapping = initial_speaker_mapping(absolute_segments)
+            mapping_evidence = {
+                raw_speaker: "assigned by first appearance in the first chunk"
+                for raw_speaker in speaker_mapping
+            }
+        else:
+            speaker_mapping, mapping_evidence = reconcile_speaker_mapping(
+                absolute_segments, previous_segments, existing_speakers
+            )
+        global_segments = apply_speaker_mapping(absolute_segments, speaker_mapping, index)
+        existing_speakers.update(segment["speaker"] for segment in global_segments)
+        merged_segments.extend(select_core_segments(global_segments, chunk, is_last))
+        previous_segments = global_segments
+
+        if is_first:
+            references = build_speaker_references(source, global_segments, reference_dir)
+            if references:
+                print(
+                    "Prepared speaker references for later chunks: "
+                    + ", ".join(name for name, _ in references)
+                )
+            else:
+                print("Warning: continuing without speaker references")
+
+        for event in raw.get("stream_events", []):
+            merged_events.append({"chunk_index": index, **event})
+        chunk_records.append(
+            {
+                **chunk,
+                "api_raw_json": str(raw_path.resolve()),
+                "speaker_mapping": speaker_mapping,
+                "speaker_mapping_evidence": mapping_evidence,
+                "usage": raw.get("usage"),
+            }
+        )
+
+    merged_segments.sort(key=lambda segment: (segment["start"], segment["end"]))
+    merged_raw = {
+        "task": "transcribe",
+        "duration": original_duration,
+        "text": " ".join(segment["text"] for segment in merged_segments if segment["text"]),
+        "segments": merged_segments,
+        "usage": [record.get("usage") for record in chunk_records],
+        "streamed": True,
+        "locally_chunked": True,
+        "chunks": chunk_records,
+        "stream_events": merged_events,
+    }
+    manifest["prepared_audio"]["chunks"] = chunk_records
+    outputs = render_results(merged_raw, manifest)
+    for label, path in outputs.items():
+        print(f"{label}: {path}")
+
+
 def normalized_segments(raw: dict, offset: float) -> tuple[list[dict], dict[str, str]]:
     raw_segments = raw.get("segments")
     if not isinstance(raw_segments, list) or not raw_segments:
         fail("the API response contains no diarized segments")
     speaker_map: dict[str, str] = {}
+    used_labels: set[str] = set()
     normalized: list[dict] = []
     for index, segment in enumerate(raw_segments):
         raw_speaker = str(segment.get("speaker", "unknown"))
         if raw_speaker not in speaker_map:
-            speaker_map[raw_speaker] = f"S{len(speaker_map) + 1}"
+            if re.fullmatch(r"S\d+", raw_speaker) and raw_speaker not in used_labels:
+                speaker_map[raw_speaker] = raw_speaker
+            else:
+                speaker_map[raw_speaker] = next_speaker_label(used_labels)
+            used_labels.add(speaker_map[raw_speaker])
         try:
             start = float(segment["start"]) + offset
             end = float(segment["end"]) + offset
@@ -484,9 +1078,13 @@ def paragraphs(segments: list[dict]) -> list[dict]:
     return output
 
 
-def review_candidates(segments: list[dict], prepared_end: float) -> list[dict]:
+def review_candidates(
+    segments: list[dict], prepared_end: float, chunk_boundaries: list[float] | None = None
+) -> list[dict]:
     candidates: list[dict] = []
-    uncertain = re.compile(r"\b(?:unverständlich|unverstaendlich|inaudible)\b|\[.*?\]|\(.*?\)", re.I)
+    uncertain = re.compile(
+        r"\b(?:unverständlich|unverstaendlich|inaudible)\b|\[.*?\]|\(.*?\)", re.I
+    )
     previous: dict | None = None
     for segment in segments:
         duration = max(0.001, segment["end"] - segment["start"])
@@ -517,11 +1115,30 @@ def review_candidates(segments: list[dict], prepared_end: float) -> list[dict]:
                 "start": segments[-1]["end"],
                 "end": prepared_end,
                 "speaker": "-",
-                "reasons": ["more than 15 seconds between the final segment and the end of the audio"],
+                "reasons": [
+                    "more than 15 seconds between the final segment and the end of the audio"
+                ],
                 "text": "",
             }
         )
-    return candidates
+    for boundary in chunk_boundaries or []:
+        start = max(0.0, boundary - 5.0)
+        end = min(prepared_end, boundary + 5.0)
+        nearby_text = " ".join(
+            segment["text"]
+            for segment in segments
+            if segment["end"] >= start and segment["start"] <= end and segment["text"]
+        )
+        candidates.append(
+            {
+                "start": start,
+                "end": end,
+                "speaker": "-",
+                "reasons": ["local chunk join; verify text and speaker continuity"],
+                "text": nearby_text,
+            }
+        )
+    return sorted(candidates, key=lambda item: (item["start"], item["end"]))
 
 
 def render_results(raw: dict, manifest: dict) -> dict[str, Path]:
@@ -536,7 +1153,11 @@ def render_results(raw: dict, manifest: dict) -> dict[str, Path]:
     offset = float(prepared["offset_seconds"])
     segments, speaker_map = normalized_segments(raw, offset)
     prepared_end = offset + float(prepared["duration_seconds"])
-    review = review_candidates(segments, prepared_end)
+    chunk_boundaries = [
+        float(chunk["core_end_seconds"])
+        for chunk in prepared.get("chunks", [])[:-1]
+    ]
+    review = review_candidates(segments, prepared_end, chunk_boundaries)
 
     normalized_path = output_dir / "transcript.json"
     txt_path = output_dir / "transcript.txt"
@@ -618,6 +1239,12 @@ def render_results(raw: dict, manifest: dict) -> dict[str, Path]:
 
 
 def transcribe(source: Path, kind: str, start: float, sample_duration: float, force: bool) -> None:
+    if (
+        kind == "full"
+        and duration_seconds(probe(source)) >= MODEL_MAX_AUDIO_SECONDS - LOCAL_CHUNK_SAFETY_SECONDS
+    ):
+        transcribe_chunked(source, force=force)
+        return
     audio_path, manifest = prepare_audio(
         source,
         kind=kind,
@@ -692,13 +1319,20 @@ def main() -> None:
         fail(f"source file does not exist: {source}")
     kind = args.kind if args.command == "prepare" else args.command
     if args.command == "prepare":
-        prepare_audio(
-            source,
-            kind=kind,
-            start=args.start,
-            sample_duration=args.duration,
-            force=args.force,
-        )
+        if (
+            kind == "full"
+            and duration_seconds(probe(source))
+            >= MODEL_MAX_AUDIO_SECONDS - LOCAL_CHUNK_SAFETY_SECONDS
+        ):
+            prepare_chunked_audio(source, force=args.force)
+        else:
+            prepare_audio(
+                source,
+                kind=kind,
+                start=args.start,
+                sample_duration=args.duration,
+                force=args.force,
+            )
     else:
         transcribe(source, kind, args.start, args.duration, args.force)
 
