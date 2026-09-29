@@ -78,6 +78,17 @@ Ako ključ postavljate preko upravitelja tajni ili lokalne postavke okruženja,
 izostavite `export`/`unset`. Ne stavljajte ključ u `.env`, izvornu skriptu,
 shell-povijest ili razgovor bez izričite zaštite tog spremišta.
 
+Iz već postojećeg `transcript.json` možete ponovno izvesti MAXQDA i obične TXT
+datoteke bez API ključa i bez slanja zvuka:
+
+```bash
+python3 scripts/transcribe_interview.py export \
+  "data/results/interview-19-established-no5-7-mar-2026/full/transcript.json"
+```
+
+Naredba `export` stvara datoteke u istoj mapi i dopunjuje njihove putanje u
+`run_manifest.json`. Ne mijenja `transcript.json` ni postojeći `transcript.txt`.
+
 ## Izlazi
 
 Za svaki način (`sample` ili `full`) nastaju:
@@ -87,6 +98,9 @@ Za svaki način (`sample` ili `full`) nastaju:
 - `transcript.json`: normalizirani segmenti, vremena u odnosu na original i
   oznake `S1`, `S2`;
 - `transcript.txt`: čitljivi odlomci s govornicima i vremenskim oznakama;
+- `transcript_maxqda.txt`: jedna oznaka `[hh:mm:ss]` na kraju svakog odlomka;
+- `transcript_maxqda_precise.txt`: jedna oznaka `(h:mm:ss.xx)` na kraju odlomka;
+- `transcript_plain.txt`: isti odlomci bez vremenskih oznaka;
 - `manual_review.txt`: heuristički popis mjesta za preslušavanje;
 - `run_manifest.json`: model, postavke, kontrolne sume, izvor i izlazne putanje.
 
@@ -98,6 +112,17 @@ oko svih mjesta spajanja.
 (`logprobs`). Zato je rezultat nacrt: popis za provjeru nije iscrpan, a nejasna
 mjesta treba označiti s `[unverständlich]` tek nakon preslušavanja. Skripta ne
 sažima niti jezično dotjeruje tekst nakon API odgovora.
+
+Za MAXQDA prvo pokušajte `Import → Transcripts → Transcript with Timestamps` i
+odaberite `transcript_maxqda.txt`. Kad MAXQDA zatraži medij, odaberite lokalni
+`data/work/interview-19-established-no5-7-mar-2026/audio/full_56k.m4a`.
+Ako želite ispitati precizniji format, uvezite `transcript_maxqda_precise.txt`
+kao zaseban dokument i provjerite da MAXQDA prepoznaje oznake. Za uvoz bez
+povezivanja sa zvukom koristite `transcript_plain.txt`. Oznake se temelje na
+završetku odlomka u zvuku; u osnovnom MAXQDA formatu sekunde se odsijecaju,
+a u preciznom zaokružuju na stotinku sekunde.
+
+MAXQDA dokumentacija: https://www.maxqda.com/help/import/transcripts
 
 ## Trošak i ograničenja (provjereno 2026-09-20)
 

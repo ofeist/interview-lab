@@ -89,6 +89,28 @@ class ChunkingTests(unittest.TestCase):
 
 
 class OutputTests(unittest.TestCase):
+    def test_maxqda_exports_use_paragraph_end_times(self) -> None:
+        segments = [
+            {"start": 950.0, "end": 952.0, "speaker": "S1", "text": "Pseudonym"},
+            {"start": 952.1, "end": 954.684, "speaker": "S1", "text": "hast du gemeint."},
+            {"start": 955.0, "end": 962.23, "speaker": "S2", "text": "Ja, genau."},
+        ]
+
+        self.assertEqual(
+            transcription.render_maxqda_text(segments, precise=False),
+            "S1: Pseudonym hast du gemeint. [00:15:54]\n\n"
+            "S2: Ja, genau. [00:16:02]\n",
+        )
+        self.assertEqual(
+            transcription.render_maxqda_text(segments, precise=True),
+            "S1: Pseudonym hast du gemeint. (0:15:54.68)\n\n"
+            "S2: Ja, genau. (0:16:02.23)\n",
+        )
+        self.assertEqual(
+            transcription.render_maxqda_text(segments, precise=None),
+            "S1: Pseudonym hast du gemeint.\n\nS2: Ja, genau.\n",
+        )
+
     def test_short_backchannels_are_not_review_candidates(self) -> None:
         segments = [
             {"start": 0.0, "end": 0.2, "speaker": "S1", "text": "Ja."},

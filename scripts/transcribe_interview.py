@@ -1168,6 +1168,54 @@ def paragraphs(segments: list[dict]) -> list[dict]:
     return output
 
 
+def format_maxqda_timestamp(seconds: float, *, precise: bool) -> str:
+    if precise:
+        centiseconds = max(0, round(seconds * 100))
+        hours, remainder = divmod(centiseconds, 360_000)
+        minutes, remainder = divmod(remainder, 6_000)
+        whole_seconds, fraction = divmod(remainder, 100)
+        return f"({hours}:{minutes:02d}:{whole_seconds:02d}.{fraction:02d})"
+    whole_seconds = max(0, math.floor(seconds))
+    hours, remainder = divmod(whole_seconds, 3600)
+    minutes, whole_seconds = divmod(remainder, 60)
+    return f"[{hours:02d}:{minutes:02d}:{whole_seconds:02d}]"
+
+
+def render_maxqda_text(segments: list[dict], *, precise: bool | None) -> str:
+    lines: list[str] = []
+    previous_timestamp = -1.0
+    for paragraph in paragraphs(segments):
+        line = f"{paragraph['speaker']}: {paragraph['text']}"
+        if precise is not None:
+            timestamp = float(paragraph["end"])
+            if timestamp < previous_timestamp:
+                fail("paragraph timestamps go backwards; inspect the source transcript")
+            line += f" {format_maxqda_timestamp(timestamp, precise=precise)}"
+            previous_timestamp = timestamp
+        lines.append(line)
+    return "\n\n".join(lines) + "\n"
+
+
+def export_transcript_formats(normalized_path: Path) -> dict[str, Path]:
+    try:
+        normalized = json.loads(normalized_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        fail(f"could not read normalized transcript {normalized_path}: {exc}")
+    segments = normalized.get("segments")
+    if not isinstance(segments, list) or not segments:
+        fail(f"normalized transcript contains no segments: {normalized_path}")
+    outputs = {
+        "maxqda": normalized_path.with_name("transcript_maxqda.txt"),
+        "maxqda_precise": normalized_path.with_name("transcript_maxqda_precise.txt"),
+        "plain": normalized_path.with_name("transcript_plain.txt"),
+    }
+    for label, precise in (("maxqda", False), ("maxqda_precise", True), ("plain", None)):
+        outputs[label].write_text(
+            render_maxqda_text(segments, precise=precise), encoding="utf-8"
+        )
+    return outputs
+
+
 def review_candidates(
     segments: list[dict], prepared_end: float, chunk_boundaries: list[float] | None = None
 ) -> list[dict]:
@@ -1282,6 +1330,7 @@ def render_results(raw: dict, manifest: dict) -> dict[str, Path]:
         for item in paragraphs(segments)
     ]
     txt_path.write_text("\n\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    export_paths = export_transcript_formats(normalized_path)
 
     review_lines = [
         "LOCATIONS FOR MANUAL REVIEW",
@@ -1310,6 +1359,9 @@ def render_results(raw: dict, manifest: dict) -> dict[str, Path]:
             "api_raw_json": str(raw_path.resolve()),
             "normalized_json": str(normalized_path.resolve()),
             "transcript_txt": str(txt_path.resolve()),
+            "transcript_maxqda_txt": str(export_paths["maxqda"].resolve()),
+            "transcript_maxqda_precise_txt": str(export_paths["maxqda_precise"].resolve()),
+            "transcript_plain_txt": str(export_paths["plain"].resolve()),
             "manual_review_txt": str(review_path.resolve()),
         },
         "speaker_map": speaker_map,
@@ -1321,6 +1373,7 @@ def render_results(raw: dict, manifest: dict) -> dict[str, Path]:
         "raw": raw_path,
         "json": normalized_path,
         "txt": txt_path,
+        **export_paths,
         "review": review_path,
         "manifest": settings_path,
     }
@@ -1388,6 +1441,10 @@ def parse_args() -> argparse.Namespace:
     render_parser = commands.add_parser("render", help="regenerate outputs from raw API JSON")
     render_parser.add_argument("raw_json", type=Path)
     render_parser.add_argument("prepared_audio", type=Path)
+    export_parser = commands.add_parser(
+        "export", help="create MAXQDA and plain TXT files from an existing transcript.json"
+    )
+    export_parser.add_argument("transcript_json", type=Path)
     return parser.parse_args()
 
 
@@ -1399,6 +1456,23 @@ def main() -> None:
     if args.command == "render":
         raw = json.loads(args.raw_json.read_text(encoding="utf-8"))
         outputs = render_results(raw, existing_manifest(args.prepared_audio.resolve()))
+        for label, path in outputs.items():
+            print(f"{label}: {path}")
+        return
+    if args.command == "export":
+        normalized_path = args.transcript_json.resolve()
+        outputs = export_transcript_formats(normalized_path)
+        settings_path = normalized_path.with_name("run_manifest.json")
+        if settings_path.is_file():
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            settings.setdefault("outputs", {}).update(
+                {
+                    "transcript_maxqda_txt": str(outputs["maxqda"].resolve()),
+                    "transcript_maxqda_precise_txt": str(outputs["maxqda_precise"].resolve()),
+                    "transcript_plain_txt": str(outputs["plain"].resolve()),
+                }
+            )
+            write_json(settings_path, settings)
         for label, path in outputs.items():
             print(f"{label}: {path}")
         return
