@@ -1,6 +1,6 @@
 # Interview Lab
 
-Transcribe German interviews with speaker labels and timestamps, then export
+Transcribe interviews with speaker labels and timestamps, then export
 formats for MAXQDA. The script uses `gpt-4o-transcribe-diarize` through the
 OpenAI Transcriptions API. Transcripts are drafts that need audio review.
 
@@ -31,11 +31,13 @@ echo
 export OPENAI_API_KEY
 ```
 
-Transcribe an eight-minute sample and check its speakers and wording:
+Transcribe a validation sample and check its speakers and wording:
 
 ```bash
-python3 scripts/transcribe_interview.py sample "data/raw/INTERVIEW.mp4" --duration 480
+python3 scripts/transcribe_interview.py sample "data/raw/INTERVIEW.mp4"
 ```
+
+Use `--start` and `--duration` to select a different section of the recording.
 
 Then transcribe the full interview:
 
@@ -100,9 +102,7 @@ lists its recognized timestamp formats.
 ## More detail
 
 [Transcription procedure](docs/TRANSCRIPTION.md) covers preparation,
-recovery, cost estimates, and the research-data considerations. The detailed
-procedure is currently written in Croatian; code, comments, identifiers, and
-this README are in English.
+recovery, cost estimates, and research-data considerations.
 
 Run the local checks with:
 

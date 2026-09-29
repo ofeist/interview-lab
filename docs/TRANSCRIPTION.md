@@ -1,153 +1,170 @@
-# Postupak transkripcije intervjua
+# Interview Transcription Procedure
 
-Skripta `scripts/transcribe_interview.py` čuva original u `data/raw/`, izrađuje
-izvedeni audio u `data/work/` i sprema rezultate u `data/results/`. API ključ
-čita isključivo iz varijable okruženja `OPENAI_API_KEY`; ključ se ne zapisuje u
-projekt, zapis postavki ni naredbeni redak.
+`scripts/transcribe_interview.py` keeps the source recording in `data/raw/`,
+creates prepared audio in `data/work/`, and writes transcripts to
+`data/results/`. It reads the API key only from the `OPENAI_API_KEY` environment
+variable. The key is never written to project files, run manifests, or command
+arguments.
 
-## Odabrani postupak
+## Current configuration
 
-- model: `gpt-4o-transcribe-diarize`
-- jezik: `de`
-- format odgovora: `diarized_json`
-- podjela na strani API-ja: `chunking_strategy=auto` (VAD)
-- prijenos odgovora: `stream=true`; skripta prikazuje napredak po dovršenim
-  govornim segmentima i izbjegava dugo čekanje bez mrežnih podataka
-- govornici: neutralne oznake `S1`, `S2` itd.; uloge se dodjeljuju tek nakon
-  ljudske provjere
-- lokalni dijelovi: najviše približno 20 minuta, granice blizu tišine i 10
-  sekundi preklapanja sa svake strane; ovo je potrebno jer je API za odabrani
-  model vratio maksimalno trajanje od 1.400 sekundi po zahtjevu
-- dosljednost govornika: ako postoji probni transkript iste izvorne snimke,
-  skripta koristi njegove provjerene oznake za ispravljanje oznaka prvog dijela;
-  zatim izrađuje kratke lokalne glasovne reference (do četiri govornika) i
-  šalje ih uz sljedeće dijelove te dodatno uspoređuje govornike u preklapanju
-- spajanje: vremenske oznake vraćaju se na vrijeme originala, a segmenti se
-  zadržavaju prema središtu nepreklapajućeg područja kako se preklapanje ne bi
-  dupliciralo
-- oporavak: svaki uspješno dovršen API dio odmah se sprema i ponovno koristi
-  nakon mrežne pogreške ili prekida procesa
+- Model: `gpt-4o-transcribe-diarize`.
+- Input language parameter: `de`, matching the current interview collection.
+  This is currently a script setting, not a command-line option.
+- Response format: `diarized_json`.
+- API-side speech segmentation: `chunking_strategy=auto` (voice activity
+  detection). This is separate from the local splitting described below.
+- Response delivery: `stream=true`. The script reports completed speech
+  segments and progress while the API works.
+- Speakers: neutral labels such as `S1` and `S2`. Roles are assigned only after
+  human review.
+- Local splitting: chunks of approximately 20 minutes, boundaries near silence,
+  and 10 seconds of overlap on each side of an internal boundary. The API
+  returned a 1,400-second maximum for this model when given the first full
+  interview.
+- Speaker continuity: when a validation sample exists for the same source
+  recording, its checked speaker labels help map the first full chunk. The
+  script then creates short local voice references for up to four speakers and
+  sends them with later chunks. It also compares speakers in the overlap.
+- Merging: timestamps are restored to the original recording's timeline.
+  Segments are selected by their midpoint in each non-overlapping core area to
+  avoid duplicate text from the overlaps.
+- Recovery: each completed API chunk is saved immediately and reused after a
+  connection failure or interrupted process.
 
-Službena dokumentacija:
+Official API documentation:
 
 - https://developers.openai.com/api/docs/guides/speech-to-text
 - https://developers.openai.com/api/docs/models/gpt-4o-transcribe-diarize
 - https://developers.openai.com/api/docs/pricing
 
-## Naredbe
+## Commands
 
-Tehnički pregled bez promjena:
+Inspect a recording without changing it or calling the API:
 
 ```bash
-python3 scripts/transcribe_interview.py inspect "data/raw/IME_DATOTEKE.mp4"
+python3 scripts/transcribe_interview.py inspect "data/raw/INTERVIEW.mp4"
 ```
 
-Priprema osam minuta bez API poziva:
+Prepare a validation sample without calling the API:
 
 ```bash
 python3 scripts/transcribe_interview.py prepare \
-  "data/raw/IME_DATOTEKE.mp4" --kind sample --duration 480
+  "data/raw/INTERVIEW.mp4" --kind sample
 ```
 
-Probna transkripcija prvih osam minuta:
+Transcribe the validation sample:
 
 ```bash
 read -rsp 'OpenAI API key: ' OPENAI_API_KEY
+echo
 export OPENAI_API_KEY
-python3 scripts/transcribe_interview.py sample \
-  "data/raw/IME_DATOTEKE.mp4" --duration 480
+python3 scripts/transcribe_interview.py sample "data/raw/INTERVIEW.mp4"
 unset OPENAI_API_KEY
 ```
 
-Nakon provjere uzorka, cijeli intervju obrađuje se istom skriptom:
+The sample defaults to the first 480 seconds. Use `--start SECONDS` and
+`--duration SECONDS` to select a different passage and length. Review the
+sample's wording and speaker labels before processing the full recording.
+
+Transcribe the full interview:
 
 ```bash
 read -rsp 'OpenAI API key: ' OPENAI_API_KEY
+echo
 export OPENAI_API_KEY
-python3 scripts/transcribe_interview.py full "data/raw/IME_DATOTEKE.mp4"
+python3 scripts/transcribe_interview.py full "data/raw/INTERVIEW.mp4"
 unset OPENAI_API_KEY
 ```
 
-Ako je snimka dulja od sigurnog limita modela, naredba `full` automatski
-priprema i obrađuje lokalne dijelove. Nije potrebna posebna naredba za spajanje.
-Ponovno pokretanje iste naredbe koristi već dovršene dijelove. Nemojte koristiti
-`--force` pri nastavku prekinutog rada jer ta opcija ponovno priprema audio i
-ponovno šalje sve dijelove API-ju.
+For a recording longer than the safe per-request model limit, `full` prepares
+and processes local chunks automatically. No separate merge command is needed.
+Rerun the same command after an interruption to reuse completed chunks. Do not
+use `--force` when resuming: it re-prepares the audio and resends every chunk.
 
-Ako ključ postavljate preko upravitelja tajni ili lokalne postavke okruženja,
-izostavite `export`/`unset`. Ne stavljajte ključ u `.env`, izvornu skriptu,
-shell-povijest ili razgovor bez izričite zaštite tog spremišta.
+If a secret manager already sets `OPENAI_API_KEY`, skip the `read`, `export`, and
+`unset` lines. Do not paste the key into chat, source code, or shell history.
 
-Iz već postojećeg `transcript.json` možete ponovno izvesti MAXQDA i obične TXT
-datoteke bez API ključa i bez slanja zvuka:
+To regenerate the MAXQDA and plain TXT files from an existing transcript, with
+no API key and no audio upload:
 
 ```bash
 python3 scripts/transcribe_interview.py export \
-  "data/results/interview-19-established-no5-7-mar-2026/full/transcript.json"
+  "data/results/INTERVIEW_SLUG/full/transcript.json"
 ```
 
-Naredba `export` stvara datoteke u istoj mapi i dopunjuje njihove putanje u
-`run_manifest.json`. Ne mijenja `transcript.json` ni postojeći `transcript.txt`.
+The `export` command writes the TXT files beside `transcript.json` and updates
+their paths in `run_manifest.json`. It does not alter `transcript.json` or the
+existing `transcript.txt`.
 
-## Izlazi
+## Outputs
 
-Za svaki način (`sample` ili `full`) nastaju:
+Each `sample` or `full` run writes these files under
+`data/results/<interview>/<sample-or-full>/`:
 
-- `api_raw.json`: objedinjeni streaming odgovor, uključujući izvorne API
-  događaje u `stream_events`;
-- `transcript.json`: normalizirani segmenti, vremena u odnosu na original i
-  oznake `S1`, `S2`;
-- `transcript.txt`: čitljivi odlomci s govornicima i vremenskim oznakama;
-- `transcript_maxqda.txt`: jedna oznaka `[hh:mm:ss]` na kraju svakog odlomka;
-- `transcript_maxqda_precise.txt`: jedna oznaka `(h:mm:ss.xx)` na kraju odlomka;
-- `transcript_plain.txt`: isti odlomci bez vremenskih oznaka;
-- `manual_review.txt`: heuristički popis mjesta za preslušavanje;
-- `run_manifest.json`: model, postavke, kontrolne sume, izvor i izlazne putanje.
+- `api_raw.json`: combined streaming response, including original API events
+  in `stream_events`.
+- `transcript.json`: normalized segments, timestamps relative to the original
+  recording, and speaker labels.
+- `transcript.txt`: readable paragraphs with precise timestamp ranges.
+- `transcript_maxqda.txt`: one `[hh:mm:ss]` timestamp at the end of each
+  paragraph.
+- `transcript_maxqda_precise.txt`: one `(h:mm:ss.xx)` timestamp at the end of
+  each paragraph.
+- `transcript_plain.txt`: the same paragraphs without timestamps.
+- `manual_review.txt`: a heuristic list of passages to replay.
+- `run_manifest.json`: model, settings, checksums, source information, and
+  output paths.
 
-Za lokalno podijeljeni intervju nastaje i poddirektorij `chunks/` s izvornim
-API odgovorom svakog dijela. `manual_review.txt` automatski uključuje područja
-oko svih mjesta spajanja.
+Locally split interviews also have a `chunks/` directory containing each
+completed raw API response. `manual_review.txt` includes the local join points.
 
-`gpt-4o-transcribe-diarize` uz `diarized_json` ne vraća pouzdanost riječi
-(`logprobs`). Zato je rezultat nacrt: popis za provjeru nije iscrpan, a nejasna
-mjesta treba označiti s `[unverständlich]` tek nakon preslušavanja. Skripta ne
-sažima niti jezično dotjeruje tekst nakon API odgovora.
+The diarization model does not return word-level confidence scores with
+`diarized_json`. Treat the transcript as a draft. The review list is not
+exhaustive; mark unclear passages as `[unverständlich]` only after listening.
+The script does not summarize or polish the API's transcription text.
 
-Za MAXQDA prvo pokušajte `Import → Transcripts → Transcript with Timestamps` i
-odaberite `transcript_maxqda.txt`. Kad MAXQDA zatraži medij, odaberite lokalni
-`data/work/interview-19-established-no5-7-mar-2026/audio/full_56k.m4a`.
-Ako želite ispitati precizniji format, uvezite `transcript_maxqda_precise.txt`
-kao zaseban dokument i provjerite da MAXQDA prepoznaje oznake. Za uvoz bez
-povezivanja sa zvukom koristite `transcript_plain.txt`. Oznake se temelje na
-završetku odlomka u zvuku; u osnovnom MAXQDA formatu sekunde se odsijecaju,
-a u preciznom zaokružuju na stotinku sekunde.
+## MAXQDA import
 
-MAXQDA dokumentacija: https://www.maxqda.com/help/import/transcripts
+First, select **Import → Transcripts → Transcript with Timestamps** and import
+`transcript_maxqda.txt`. When MAXQDA asks for the media file, choose the local
+recording corresponding to the transcript. For the first interview in this
+project, `data/work/interview-19-established-no5-7-mar-2026/audio/full_56k.m4a`
+is available. Test whether clicking a timestamp opens the correct audio
+position.
 
-## Trošak i ograničenja (provjereno 2026-09-20)
+Import `transcript_maxqda_precise.txt` separately if you want to test the
+more precise format. Use `transcript_plain.txt` for an import without timestamp
+links. Both timestamped formats use paragraph end times. The whole-second
+format drops the fraction; the precise format rounds to a hundredth of a
+second.
 
-Dokumentacija navodi limit od 25 MB po datoteci. Stranica modela navodi cijene
-audio-ulaza od 2,50 USD i tekstualnog izlaza od 10,00 USD na milijun tokena.
-Javni cjenik ne prikazuje zaseban minutni red za diarizirani model; zato se za
-planiranje koristi približna stopa `gpt-4o-transcribe` od 0,006 USD/min, a
-stvarni iznos može odstupati zbog tokenizacije.
+MAXQDA documentation: https://www.maxqda.com/help/import/transcripts
 
-Javna dokumentacija ne navodi maksimalno trajanje pojedinačnog zahtjeva. API je
-za ovu snimku vratio limit od 1.400 sekundi za
-`gpt-4o-transcribe-diarize`, pa skripta ostavlja dodatnu sigurnosnu marginu.
+## Cost and limits (information checked on 2026-09-20)
 
-Početna procjena prema javnoj zamjenskoj minutnoj stopi bila je približno 0,30
-USD za ovu snimku, 5,40 USD za 15 sati i 0,05 USD za probnih osam minuta.
-Stvarno zabilježeni trošak prvog 8-minutnog diarizacijskog zahtjeva bio je 0,10
-USD (zahtjev je završio klijentskim timeoutom). Ako se ta stopa pokaže
-reprezentativnom, praktična procjena iznosi približno 0,63 USD za ovu snimku i
-11,25 USD za 15 sati. Neuspjeli ili ponovljeni zahtjevi mogu se dodatno
-naplatiti. Cijene i stvarnu potrošnju treba provjeriti prije veće serije.
+The API documentation specifies a 25 MB file limit. The model page listed
+audio input at USD 2.50 and text output at USD 10.00 per million tokens. The
+public pricing page did not give a separate per-minute rate for the diarized
+model. An earlier planning estimate used the approximately USD 0.006/minute
+rate for `gpt-4o-transcribe` as a proxy; actual token-based charges can differ.
 
-## Metodološka napomena
+The public documentation did not list a maximum duration for one request. The
+API returned a 1,400-second limit for `gpt-4o-transcribe-diarize` when this
+project submitted its first full interview, so the script leaves a safety
+margin below that observed limit.
 
-Prije slanja istraživačkog materijala van lokalnog računala treba potvrditi da
-su privola sudionika, etičko odobrenje, ugovor o obradi podataka i pravila
-ustanove usklađeni s odabranim pružateljem API-ja. Izvedene audio-datoteke i
-transkripti mogu sadržavati osobne podatke te zahtijevaju istu razinu zaštite
-kao original.
+The initial proxy estimate was about USD 0.30 for the first recording, USD
+5.40 for 15 hours, and USD 0.05 for its validation sample. The observed charge
+for that initial 480-second diarization request was USD 0.10; the client timed
+out before receiving the result. If that observed rate is representative,
+rough planning figures are USD 0.63 for the first recording and USD 11.25 for
+15 hours. Failed or repeated requests may add charges. Check current pricing
+and actual project usage before processing a larger collection.
+
+## Research-data note
+
+Before sending research recordings to an external service, confirm that the
+participants' consent, ethics approval, data-processing agreement, and
+institutional rules allow the chosen provider. Prepared audio and transcripts
+may contain personal data and need the same protection as the originals.
