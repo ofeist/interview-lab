@@ -849,5 +849,40 @@ class ReviewCandidateTests(unittest.TestCase):
             [(1195.0, 1205.0, "an der Grenze"), (1203.0, 1300.0, "")],
         )
 
+
+class ApiKeyCheckTests(unittest.TestCase):
+    """Fail on a missing key before ffmpeg work starts."""
+
+    def test_missing_key_stops_before_audio_preparation(self) -> None:
+        for kind in ("sample", "full"):
+            for environment in ({}, {"OPENAI_API_KEY": ""}):
+                with self.subTest(kind=kind, environment=environment):
+                    with (
+                        mock.patch.dict(transcription.os.environ, environment, clear=True),
+                        mock.patch.object(transcription, "probe") as probe,
+                        mock.patch.object(transcription, "prepare_audio") as prepare_audio,
+                        mock.patch.object(transcription, "transcribe_chunked") as transcribe_chunked,
+                        self.assertRaises(SystemExit) as raised,
+                    ):
+                        transcription.transcribe(Path("interview.mp4"), kind, 0.0, 480.0, False)
+
+                    self.assertIn("OPENAI_API_KEY is not set", str(raised.exception))
+                    probe.assert_not_called()
+                    prepare_audio.assert_not_called()
+                    transcribe_chunked.assert_not_called()
+
+    def test_present_key_continues_to_chunked_transcription(self) -> None:
+        with (
+            mock.patch.dict(transcription.os.environ, {"OPENAI_API_KEY": "test-key"}, clear=True),
+            mock.patch.object(
+                transcription, "probe", return_value={"format": {"duration": "3600"}}
+            ),
+            mock.patch.object(transcription, "transcribe_chunked") as transcribe_chunked,
+        ):
+            transcription.transcribe(Path("interview.mp4"), "full", 0.0, 480.0, False)
+
+        transcribe_chunked.assert_called_once_with(Path("interview.mp4"), force=False)
+
+
 if __name__ == "__main__":
     unittest.main()

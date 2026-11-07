@@ -629,6 +629,16 @@ def collect_streamed_transcription(
     }
 
 
+def require_api_key() -> str:
+    api_key = os.environ.get("OPENAI_API_KEY")
+    if not api_key:
+        fail(
+            "OPENAI_API_KEY is not set. Configure it in the local environment; "
+            "do not put it in chat or a project file."
+        )
+    return api_key
+
+
 def call_api(
     audio_path: Path,
     total_duration: float,
@@ -640,12 +650,7 @@ def call_api(
     core_start: float | None = None,
     core_end: float | None = None,
 ) -> dict:
-    api_key = os.environ.get("OPENAI_API_KEY")
-    if not api_key:
-        fail(
-            "OPENAI_API_KEY is not set. Configure it in the local environment; "
-            "do not put it in chat or a project file."
-        )
+    api_key = require_api_key()
     fields = [
         ("model", MODEL),
         ("language", LANGUAGE),
@@ -1438,6 +1443,8 @@ def render_results(raw: dict, manifest: dict) -> dict[str, Path]:
 
 
 def transcribe(source: Path, kind: str, start: float, sample_duration: float, force: bool) -> None:
+    # Check before audio preparation, which can take minutes for long recordings.
+    require_api_key()
     if (
         kind == "full"
         and duration_seconds(probe(source)) >= MODEL_MAX_AUDIO_SECONDS - LOCAL_CHUNK_SAFETY_SECONDS
@@ -1451,11 +1458,6 @@ def transcribe(source: Path, kind: str, start: float, sample_duration: float, fo
         sample_duration=sample_duration,
         force=force,
     )
-    if not os.environ.get("OPENAI_API_KEY"):
-        fail(
-            "OPENAI_API_KEY is not set. Configure it in the local environment; "
-            "do not put it in chat or a project file."
-        )
     print(f"Sending {audio_path.name} to {MODEL}...")
     raw = call_api(audio_path, float(manifest["prepared_audio"]["duration_seconds"]))
     outputs = render_results(raw, manifest)
