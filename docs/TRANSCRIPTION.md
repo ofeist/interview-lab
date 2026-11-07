@@ -27,8 +27,12 @@ arguments.
   script then creates short local voice references for up to four speakers and
   sends them with later chunks. It also compares speakers in the overlap.
 - Merging: timestamps are restored to the original recording's timeline.
-  Segments are selected by their midpoint in each non-overlapping core area to
-  avoid duplicate text from the overlaps.
+  At each join, both chunks are cut at one shared point in the audio they both
+  contain, at least 1 second from its edges, chosen where it splits the least
+  speech in either chunk. Segments are then assigned by their midpoint. This
+  timing heuristic usually keeps overlap speech once when the chunks segment it
+  differently, but speech without a pause across the overlap can still be lost
+  or repeated. Check each join listed in `manual_review.txt`.
 - Recovery: each completed API chunk is saved immediately and reused after a
   connection failure or interrupted process.
 

@@ -85,9 +85,7 @@ class ChunkingTests(unittest.TestCase):
             {"start": 99.0, "end": 101.0},
             {"start": 101.0, "end": 105.0},
         ]
-        chunk = {"core_start_seconds": 100.0, "core_end_seconds": 200.0}
-
-        selected = transcription.select_core_segments(segments, chunk, False)
+        selected = transcription.select_core_segments(segments, 100.0, 200.0)
 
         self.assertEqual(selected, segments[1:])
 
@@ -358,10 +356,75 @@ class ChunkMergeTests(unittest.TestCase):
 
     def test_last_chunk_keeps_segments_after_core_end(self) -> None:
         segments = [{"start": 199.0, "end": 203.0}]
-        chunk = {"core_start_seconds": 100.0, "core_end_seconds": 200.0}
+        self.assertEqual(transcription.select_core_segments(segments, 100.0, None), segments)
+        self.assertEqual(transcription.select_core_segments(segments, 100.0, 200.0), [])
 
-        self.assertEqual(transcription.select_core_segments(segments, chunk, True), segments)
-        self.assertEqual(transcription.select_core_segments(segments, chunk, False), [])
+    def merge_join(self, previous: list[tuple], current: list[tuple]) -> tuple[float, list]:
+        def segments(items: list[tuple], chunk: str) -> list[dict]:
+            return [
+                {"start": start, "end": end, "text": text, "chunk": chunk}
+                for start, end, text in items
+            ]
+
+        previous_segments = segments(previous, "previous")
+        current_segments = segments(current, "current")
+        cut = transcription.choose_join_cut(
+            previous_segments, current_segments, 1250.0, 1240.0, 1260.0
+        )
+        merged = transcription.select_core_segments(
+            previous_segments, 0.0, cut
+        ) + transcription.select_core_segments(current_segments, cut, None)
+        return cut, [(segment["chunk"], segment["text"]) for segment in merged]
+
+    def test_join_keeps_speech_that_chunks_segment_differently(self) -> None:
+        # Each chunk alone would drop "Grenze": its midpoints fall on opposite
+        # sides of the 1250 s boundary.
+        cut, merged = self.merge_join(
+            [(1200, 1245, "Vorher"), (1245, 1257, "Grenze"), (1257, 1262, "Danach")],
+            [(1243, 1255, "Grenze"), (1255, 1260, "Danach"), (1260, 1300, "Ende")],
+        )
+
+        self.assertEqual([text for _, text in merged], ["Vorher", "Grenze", "Danach", "Ende"])
+        self.assertTrue(1245.0 <= cut <= 1255.0)
+
+    def test_join_does_not_repeat_speech_that_chunks_segment_differently(self) -> None:
+        # Each chunk alone would keep "Grenze": its midpoints fall on opposite
+        # sides of the 1250 s boundary.
+        _, merged = self.merge_join(
+            [(1200, 1243, "Vorher"), (1243, 1249, "Grenze"), (1249, 1258, "Danach")],
+            [(1242.8, 1251, "Grenze"), (1251, 1258, "Danach"), (1258, 1300, "Ende")],
+        )
+
+        self.assertEqual([text for _, text in merged], ["Vorher", "Grenze", "Danach", "Ende"])
+
+    def test_join_moves_to_a_shared_edge_near_the_boundary(self) -> None:
+        cut, merged = self.merge_join(
+            [(1240, 1248.0, "Eins"), (1248.1, 1254.5, "Zwei")],
+            [(1240.2, 1248.1, "Eins"), (1248.1, 1254.2, "Zwei"), (1254.2, 1300, "Drei")],
+        )
+
+        self.assertEqual(cut, 1248.1)
+        self.assertEqual(
+            merged, [("previous", "Eins"), ("current", "Zwei"), ("current", "Drei")]
+        )
+
+    def test_join_uses_the_whole_shared_audio(self) -> None:
+        # No edge lies within 5 s of the boundary; the clean cuts are 6-7 s away.
+        cut, merged = self.merge_join(
+            [(1235, 1243, "Vorher"), (1243, 1257, "Grenze"), (1257, 1260, "Danach")],
+            [(1242, 1256, "Grenze"), (1256, 1260, "Danach")],
+        )
+
+        self.assertEqual([text for _, text in merged], ["Vorher", "Grenze", "Danach"])
+        self.assertTrue(1241.0 <= cut <= 1259.0)
+
+    def test_join_ignores_edges_near_the_shared_audio_edges(self) -> None:
+        cut, _ = self.merge_join(
+            [(1200, 1240.5, "Früh"), (1240.5, 1259.5, "Lang")],
+            [(1240, 1259.5, "Lang"), (1259.5, 1300, "Spät")],
+        )
+
+        self.assertEqual(cut, 1250.0)
 
 
 class ChunkCacheTests(unittest.TestCase):
@@ -437,6 +500,7 @@ class ChunkedTranscriptionTests(unittest.TestCase):
                 "sha256": "chunk-1",
                 "duration_seconds": 1260.0,
                 "upload_start_seconds": 0.0,
+                "upload_end_seconds": 1260.0,
                 "core_start_seconds": 0.0,
                 "core_end_seconds": 1250.0,
             },
@@ -446,6 +510,7 @@ class ChunkedTranscriptionTests(unittest.TestCase):
                 "sha256": "chunk-2",
                 "duration_seconds": 1260.0,
                 "upload_start_seconds": 1240.0,
+                "upload_end_seconds": 2500.0,
                 "core_start_seconds": 1250.0,
                 "core_end_seconds": 2500.0,
             },
@@ -525,7 +590,32 @@ class ChunkedTranscriptionTests(unittest.TestCase):
         )
         self.assertEqual(merged["segments"][-1]["start"], 1340.0)
         self.assertEqual(merged["chunks"][1]["speaker_mapping"], {"X": "S1", "Y": "S2"})
+        self.assertEqual(merged["chunks"][0]["merge_end_seconds"], 1252.0)
+        self.assertNotIn("merge_end_seconds", merged["chunks"][1])
         self.assertEqual(merged["text"], "Hallo Servus Grenze Danach Ende")
+
+    def test_overlap_segmented_differently_is_merged_once(self) -> None:
+        # Absolute ranges: chunk 1 hears "Grenze" at 1245-1257, chunk 2 at
+        # 1243-1255, so their midpoints fall on opposite sides of the 1250 s join.
+        variants = {
+            "speech would be lost": ((1245, 1257), (3, 15)),
+            "speech would be repeated": ((1243, 1249), (2.8, 11)),
+            "chunk 1 starts later": ((1247, 1253), (6.5, 12.5)),
+        }
+        for name, (first, second) in variants.items():
+            with self.subTest(name=name):
+                self.responses[self.chunks[0]["path"]][2] = (*first, "A", "Grenze")
+                self.responses[self.chunks[1]["path"]][0] = (*second, "X", "Grenze")
+
+                merged = self.run_chunked(mock.Mock(side_effect=self.fake_api))
+
+                self.assertEqual(merged["text"], "Hallo Servus Grenze Danach Ende")
+                self.assertEqual(
+                    [segment["speaker"] for segment in merged["segments"]],
+                    ["S1", "S2", "S1", "S2", "S1"],
+                )
+                for path in transcription.RESULTS_ROOT.glob("*/full/chunks/*.json"):
+                    path.unlink()
 
     def test_second_run_reuses_saved_chunks(self) -> None:
         self.run_chunked(mock.Mock(side_effect=self.fake_api))

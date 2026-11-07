@@ -40,6 +40,7 @@ SILENCE_SEARCH_WINDOW_SECONDS = 45.0
 SILENCE_THRESHOLD_DB = -35
 SILENCE_MIN_SECONDS = 0.45
 SPEAKER_REFERENCE_SECONDS = 5.0
+JOIN_EDGE_MARGIN_SECONDS = 1.0
 ROOT = Path(__file__).resolve().parents[1]
 WORK_ROOT = ROOT / "data" / "work"
 RESULTS_ROOT = ROOT / "data" / "results"
@@ -856,15 +857,53 @@ def apply_speaker_mapping(
     return output
 
 
-def select_core_segments(segments: list[dict], chunk: dict, is_last: bool) -> list[dict]:
-    core_start = float(chunk["core_start_seconds"])
-    core_end = float(chunk["core_end_seconds"])
+def choose_join_cut(
+    previous: list[dict],
+    current: list[dict],
+    boundary: float,
+    shared_start: float,
+    shared_end: float,
+) -> float:
+    """Choose one cut for both chunks where their segments are least divided.
+
+    Both chunks hear the overlap but may segment it differently. Cutting each
+    chunk at its own segment midpoints can drop or repeat speech, so the cut is
+    shared and placed at the segment edge or gap that splits the least speech.
+    Cuts stay a margin away from the shared audio's edges, where a chunk's
+    words may be cut off.
+    """
+    lowest = shared_start + JOIN_EDGE_MARGIN_SECONDS
+    highest = shared_end - JOIN_EDGE_MARGIN_SECONDS
+    segments = previous + current
+    candidates = {boundary} | {
+        edge
+        for segment in segments
+        for edge in (segment["start"], segment["end"])
+        if lowest <= edge <= highest
+    }
+
+    def split_cost(cut: float) -> float:
+        return max(
+            (
+                min(cut - segment["start"], segment["end"] - cut)
+                for segment in segments
+                if segment["start"] < cut < segment["end"]
+            ),
+            default=0.0,
+        )
+
+    return min(candidates, key=lambda cut: (split_cost(cut), abs(cut - boundary), cut))
+
+
+def select_core_segments(
+    segments: list[dict], start: float, end: float | None
+) -> list[dict]:
     selected: list[dict] = []
     for segment in segments:
         midpoint = (segment["start"] + segment["end"]) / 2.0
-        if midpoint < core_start:
+        if midpoint < start:
             continue
-        if midpoint >= core_end and not is_last:
+        if end is not None and midpoint >= end:
             continue
         selected.append(segment)
     return selected
@@ -1014,6 +1053,8 @@ def transcribe_chunked(source: Path, *, force: bool) -> None:
         print(f"Using validation sample for speaker continuity: {sample_path}")
     merged_segments: list[dict] = []
     previous_segments: list[dict] = []
+    previous_chunk: dict = {}
+    previous_start = 0.0
     existing_speakers: set[str] = {
         segment["speaker"] for segment in sample_segments
     }
@@ -1067,8 +1108,25 @@ def transcribe_chunked(source: Path, *, force: bool) -> None:
             )
         global_segments = apply_speaker_mapping(absolute_segments, speaker_mapping, index)
         existing_speakers.update(segment["speaker"] for segment in global_segments)
-        merged_segments.extend(select_core_segments(global_segments, chunk, is_last))
+        # A chunk's end is only known once the next chunk's segments exist.
+        current_start = float(chunk["core_start_seconds"])
+        if not is_first:
+            current_start = choose_join_cut(
+                previous_segments,
+                global_segments,
+                current_start,
+                float(chunk["upload_start_seconds"]),
+                float(previous_chunk["upload_end_seconds"]),
+            )
+            merged_segments.extend(
+                select_core_segments(previous_segments, previous_start, current_start)
+            )
+            chunk_records[-1]["merge_end_seconds"] = current_start
+        if is_last:
+            merged_segments.extend(select_core_segments(global_segments, current_start, None))
         previous_segments = global_segments
+        previous_chunk = chunk
+        previous_start = current_start
 
         if is_first:
             references = build_speaker_references(source, global_segments, reference_dir)
@@ -1290,7 +1348,7 @@ def render_results(raw: dict, manifest: dict) -> dict[str, Path]:
     segments, speaker_map = normalized_segments(raw, offset)
     prepared_end = offset + float(prepared["duration_seconds"])
     chunk_boundaries = [
-        float(chunk["core_end_seconds"])
+        float(chunk.get("merge_end_seconds", chunk["core_end_seconds"]))
         for chunk in prepared.get("chunks", [])[:-1]
     ]
     review = review_candidates(segments, prepared_end, chunk_boundaries)
