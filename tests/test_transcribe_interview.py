@@ -2,7 +2,7 @@ import io
 import json
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -882,6 +882,29 @@ class ApiKeyCheckTests(unittest.TestCase):
             transcription.transcribe(Path("interview.mp4"), "full", 0.0, 480.0, False)
 
         transcribe_chunked.assert_called_once_with(Path("interview.mp4"), force=False)
+
+
+
+class ArgumentTests(unittest.TestCase):
+    def test_sample_accepts_sample_window(self) -> None:
+        args = transcription.parse_args(
+            ["sample", "interview.mp4", "--start", "60", "--duration", "120"]
+        )
+
+        self.assertEqual((args.start, args.duration), (60.0, 120.0))
+
+    def test_full_rejects_sample_window(self) -> None:
+        for option in ("--start", "--duration"):
+            with self.subTest(option=option):
+                with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+                    transcription.parse_args(["full", "interview.mp4", option, "60"])
+
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_full_accepts_force(self) -> None:
+        args = transcription.parse_args(["full", "interview.mp4", "--force"])
+
+        self.assertEqual((args.command, args.source, args.force), ("full", Path("interview.mp4"), True))
 
 
 if __name__ == "__main__":

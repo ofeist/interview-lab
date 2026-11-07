@@ -1472,7 +1472,7 @@ def existing_manifest(audio_path: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Prepare and diarize sociological interview recordings."
     )
@@ -1488,15 +1488,17 @@ def parse_args() -> argparse.Namespace:
     prepare_parser.add_argument("--duration", type=float, default=480.0, help="sample duration in seconds")
     prepare_parser.add_argument("--force", action="store_true")
 
-    for name, help_text in (
-        ("sample", "prepare and transcribe a validation sample"),
-        ("full", "prepare and transcribe the full interview"),
-    ):
-        command = commands.add_parser(name, help=help_text)
-        command.add_argument("source", type=Path)
-        command.add_argument("--start", type=float, default=0.0)
-        command.add_argument("--duration", type=float, default=480.0)
-        command.add_argument("--force", action="store_true")
+    sample_parser = commands.add_parser("sample", help="prepare and transcribe a validation sample")
+    sample_parser.add_argument("source", type=Path)
+    sample_parser.add_argument("--start", type=float, default=0.0, help="sample start in seconds")
+    sample_parser.add_argument("--duration", type=float, default=480.0, help="sample duration in seconds")
+    sample_parser.add_argument("--force", action="store_true")
+
+    full_parser = commands.add_parser("full", help="prepare and transcribe the full interview")
+    full_parser.add_argument("source", type=Path)
+    full_parser.add_argument("--force", action="store_true")
+    # The full recording has no sample window; these values are never used for it.
+    full_parser.set_defaults(start=0.0, duration=480.0)
 
     render_parser = commands.add_parser("render", help="regenerate outputs from raw API JSON")
     render_parser.add_argument("raw_json", type=Path)
@@ -1505,7 +1507,7 @@ def parse_args() -> argparse.Namespace:
         "export", help="create MAXQDA and plain TXT files from an existing transcript.json"
     )
     export_parser.add_argument("transcript_json", type=Path)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def main() -> None:
